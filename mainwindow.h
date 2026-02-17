@@ -13,10 +13,17 @@ class MainWindow;
 }
 QT_END_NAMESPACE
 
+struct LegLocalConfig {
+    QString prefix;
+    float perimeterFraction;  // position on body rounded rect, 0=front center, +=clockwise
+};
+
 struct LegState {
     QVector2D currentFootPos;
     QVector2D targetFootPos;
     QVector2D startStepPos;
+    QVector2D currentRootPos;   // smoothly follows targetRootPos
+    QVector2D targetRootPos;    // rotated anchor position
     bool isStepping = false;
     float stepProgress = 0.0f;
 };
@@ -41,6 +48,9 @@ private:
     float m_perimeterDir = 1.0f;
     int m_frame = 0;
 
+    float m_heading = 90.0f;       // current heading (degrees)
+    float m_targetHeading = 90.0f; // target heading from edge normal
+
 
     QVector2D m_bodyVelocity;
     QVector2D m_bodyBob;
@@ -52,6 +62,7 @@ private:
     QVector2D projectToScreenEdge(const QVector2D &point) const;
     QVector2D perimeterToBodyPos(float t) const;
     float perimeterLength() const;
+    float computeHeadingFromPerimeter(float t) const;
 
     void updateAutoWalk();
     QVector2D getIdealFootPos(int legIndex, const QVector2D &bodyPos,
