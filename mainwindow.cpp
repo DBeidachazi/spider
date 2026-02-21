@@ -482,12 +482,17 @@ void MainWindow::showSpiderFeet() {
         foot->move(screenPos);
         foot->show();
 #ifdef Q_OS_MACOS
-        // macOS: 将蛛腿窗口层级设为普通级别(0)，低于 MainWindow 的 ToolTip 级别
+        // macOS: 蛛腿层级 0（普通），MainWindow 层级 1（高于蛛腿）
         setNativeWindowLevel(foot, 0);
 #else
         foot->stackUnder(this);
 #endif
     }
+
+#ifdef Q_OS_MACOS
+    // MainWindow 层级设为 1，高于蛛腿(0)，确保身体覆盖在腿上方
+    setNativeWindowLevel(this, 1);
+#endif
 
     // 初始化朝向
     m_heading = computeHeadingFromPerimeter(m_perimeterPos);
