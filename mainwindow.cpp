@@ -7,9 +7,13 @@
 #include <QGuiApplication>
 #include <QRandomGenerator>
 #include <QPainter>
+#include <QMediaDevices>
+#include <QCameraDevice>
+#include <functional>
 
 #ifdef Q_OS_MACOS
 extern void setNativeWindowLevel(QWidget *widget, int level);
+extern void requestCameraAccess(std::function<void(bool)> callback);
 #endif
 
 namespace SpiderTuning {
@@ -263,6 +267,52 @@ MainWindow::MainWindow(QWidget *parent)
         this->initSpiderFeet();
         this->showSpiderFeet();
     });
+
+    initCamera();
+}
+
+// ─── Camera ──────────────────────────────────────────────────
+
+void MainWindow::initCamera() {
+#ifdef Q_OS_MACOS
+    // 用原生 AVFoundation API 请求摄像头权限，绕过 Qt 的权限插件系统
+    requestCameraAccess([this](bool granted) {
+        if (granted) {
+            startCamera();
+        } else {
+            qDebug() << "Camera permission denied, falling back to white background.";
+        }
+    });
+#else
+    startCamera();
+#endif
+}
+
+void MainWindow::startCamera() {
+    QCameraDevice defaultCam = QMediaDevices::defaultVideoInput();
+    if (defaultCam.isNull()) {
+        qDebug() << "No camera available, falling back to white background.";
+        return;
+    }
+
+    m_videoWidget = new QVideoWidget(centralWidget());
+    m_videoWidget->setGeometry(0, 0, centralWidget()->width(), centralWidget()->height());
+    m_videoWidget->lower();
+    m_videoWidget->show();
+
+    m_camera = new QCamera(defaultCam, this);
+    m_captureSession = new QMediaCaptureSession(this);
+    m_captureSession->setCamera(m_camera);
+    m_captureSession->setVideoOutput(m_videoWidget);
+
+    connect(m_camera, &QCamera::errorOccurred, this, [this](QCamera::Error error, const QString &desc) {
+        qDebug() << "Camera error:" << error << desc;
+        if (m_videoWidget) {
+            m_videoWidget->hide();
+        }
+    });
+
+    m_camera->start();
 }
 
 // ─── Perimeter helpers ────────────────────────────────────────
@@ -923,4 +973,11 @@ void MainWindow::paintEvent(QPaintEvent *event)
 
     painter.setPen(QPen(Qt::blue, 2, Qt::DashLine));
     painter.drawRect(rectX, rectY, rectW, rectH);
+}
+
+void MainWindow::resizeEvent(QResizeEvent *event) {
+    QMainWindow::resizeEvent(event);
+    if (m_videoWidget && centralWidget()) {
+        m_videoWidget->setGeometry(0, 0, centralWidget()->width(), centralWidget()->height());
+    }
 }

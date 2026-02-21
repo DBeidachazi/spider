@@ -1,6 +1,11 @@
 #include "mainwindow.h"
 
 #include <QApplication>
+#include <QtPlugin>
+
+#ifdef Q_OS_MACOS
+Q_IMPORT_PLUGIN(QDarwinCameraPermissionPlugin)
+#endif
 
 int main(int argc, char *argv[])
 {

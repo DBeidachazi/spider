@@ -5,6 +5,9 @@
 #include <QDebug>
 #include <QTimer>
 #include <QVector2D>
+#include <QCamera>
+#include <QMediaCaptureSession>
+#include <QVideoWidget>
 #include "spiderfeet.h"
 
 QT_BEGIN_NAMESPACE
@@ -37,6 +40,8 @@ public:
     ~MainWindow();
     void initSpiderFeet();
     void showSpiderFeet();
+    void initCamera();
+    void startCamera();
 
 private:
     Ui::MainWindow *ui;
@@ -59,8 +64,13 @@ private:
     LegState m_legStates[4];
     QVector2D m_debugIkRoot[4];   // debug: ikRoot positions for red overlay
 
+    QCamera *m_camera = nullptr;
+    QMediaCaptureSession *m_captureSession = nullptr;
+    QVideoWidget *m_videoWidget = nullptr;
+
 protected:
     void paintEvent(QPaintEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
 
 
     QVector2D projectToScreenEdge(const QVector2D &point) const;
