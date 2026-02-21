@@ -6,6 +6,11 @@
 #include <QScreen>
 #include <QGuiApplication>
 #include <QRandomGenerator>
+#include <QPainter>
+
+#ifdef Q_OS_MACOS
+extern void setNativeWindowLevel(QWidget *widget, int level);
+#endif
 
 namespace SpiderTuning {
 constexpr int kFeetPerLeg = 12;          // 每条腿多少节
@@ -14,7 +19,7 @@ constexpr int kFootH = 50;
 constexpr int kAnimIntervalMs = 16;
 
 // IK
-constexpr float kLegLengthTotal = 220.0f;
+constexpr float kLegLengthTotal = 400.0f;
 constexpr float kStepTriggerDist = 75.0f;  // 触发距离
 constexpr float kStepSpeed = 0.15f;        // 快速迈步
 constexpr float kStepHeight = 22.0f;       // 低弧线
@@ -31,10 +36,14 @@ constexpr float kBobStrength = 1.5f;       // 脚落地时身体的冲量
 
 // 朝向驱动系统
 constexpr float kHeadingLerpSpeed = 0.08f;   // 朝向平滑速度
-constexpr float kRootLerpSpeed = 0.12f;      // 根部跟随速度
+constexpr float kRootLerpSpeed = 0.25f;      // 根部跟随速度
 constexpr float kLegAngleThreshold = 150.0f; // 腿最大偏转角度
 constexpr float kBodyRectScale = 0.80f;      // 圆角矩形为窗口的80%
 constexpr float kCornerRadiusFraction = 0.35f; // 圆角半径占短边比例
+constexpr float kBodySquish = 0.60f;          // IK根部向脚靠近60%，压扁身体使腿弯曲
+constexpr float kEdgeReachFraction = 0.40f;   // 锚点距边缘 ≤ 腿长*此值 才伸腿
+constexpr float kMinJointAngleDeg = 120.0f;   // 最小关节弯曲角度（度）
+constexpr float kCornerLookahead = 150.0f;    // 接近拐角时提前多少像素开始转向
 } // namespace SpiderTuning
 
 // 腿锚点在身体圆角矩形上的位置
@@ -161,6 +170,51 @@ static inline QVector2D localToScreen(float localRight, float localForward,
                      localRight * cosH - localForward * sinH);
 }
 
+// 关节角度约束：左腿只能向右弯，右腿只能向左弯
+// allowedBendDir: 允许弯曲的方向（屏幕空间）
+// TODO 这里调用导致蜘蛛的腿抽搐，目前左边两只腿与右边两只腿弯曲朝向一致，后面看一下从腿的定义去修改弯曲朝向
+static void constrainJointAngles(QVector<QVector2D> &joints, float segLen,
+                                  const QVector2D &allowedBendDir) {
+    const float maxBendRad = qDegreesToRadians(180.0f - SpiderTuning::kMinJointAngleDeg);
+    const float minDot = qCos(maxBendRad);  // cos(60°) = 0.5 for 120°
+
+    for (int i = 1; i < joints.size() - 1; ++i) {
+        QVector2D d1 = joints[i] - joints[i - 1];
+        if (d1.lengthSquared() < 1e-6f) continue;
+        d1.normalize();
+
+        QVector2D d2 = joints[i + 1] - joints[i];
+        if (d2.lengthSquared() < 1e-6f) continue;
+        d2.normalize();
+
+        float dot = QVector2D::dotProduct(d1, d2);
+        QVector2D perp = d2 - d1 * dot;
+        float perpLen = perp.length();
+
+        if (perpLen < 1e-6f) continue;  // 几乎笔直，无需约束
+
+        QVector2D perpDir = perp / perpLen;
+        float bendAlign = QVector2D::dotProduct(perpDir, allowedBendDir);
+
+        QVector2D newDir = d2;
+        bool corrected = false;
+
+        if (bendAlign < 0) {
+            // 弯曲方向错误 → 拉直
+            newDir = d1;
+            corrected = true;
+        } else if (dot < minDot) {
+            // 弯曲方向正确但过度 → 钳制到最大弯曲角
+            newDir = (d1 * minDot + perpDir * qSin(maxBendRad)).normalized();
+            corrected = true;
+        }
+
+        if (corrected) {
+            joints[i + 1] = joints[i] + newDir * segLen;
+        }
+    }
+}
+
 static QVector2D bezierInterp(const QVector2D &p0, const QVector2D &p1,
                                float t, float height) {
     QVector2D flat = p0 + (p1 - p0) * t;
@@ -276,6 +330,64 @@ QVector2D MainWindow::projectToScreenEdge(const QVector2D &point) const {
     return result;
 }
 
+// 带锚点距离过滤的投影：只投射到锚点足够近的边
+QVector2D MainWindow::projectToScreenEdge(const QVector2D &point,
+                                           const QVector2D &anchor,
+                                           float maxAnchorDist) const {
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (!screen) return point;
+    QRect geo = screen->geometry();
+    float left   = geo.left();
+    float right  = geo.right();
+    float top    = geo.top();
+    float bottom = geo.bottom();
+
+    // 锚点到各边的距离
+    float aDists[] = {
+        qAbs(anchor.y() - bottom),  // 0: 底边
+        qAbs(anchor.y() - top),     // 1: 顶边
+        qAbs(anchor.x() - left),    // 2: 左边
+        qAbs(anchor.x() - right),   // 3: 右边
+    };
+    // 点到各边的距离
+    float pDists[] = {
+        qAbs(point.y() - bottom),
+        qAbs(point.y() - top),
+        qAbs(point.x() - left),
+        qAbs(point.x() - right),
+    };
+
+    // 只考虑锚点足够近的边，在其中找点最近的
+    float bestDist = 1e9f;
+    int bestEdge = -1;
+    for (int i = 0; i < 4; ++i) {
+        if (aDists[i] <= maxAnchorDist && pDists[i] < bestDist) {
+            bestDist = pDists[i];
+            bestEdge = i;
+        }
+    }
+
+    // 无合格边时回退到最近边
+    if (bestEdge < 0) {
+        float dMin = qMin(qMin(pDists[0], pDists[1]), qMin(pDists[2], pDists[3]));
+        for (int i = 0; i < 4; ++i) {
+            if (pDists[i] == dMin) { bestEdge = i; break; }
+        }
+    }
+
+    QVector2D result = point;
+    switch (bestEdge) {
+    case 0: result.setY(bottom); break;
+    case 1: result.setY(top);    break;
+    case 2: result.setX(left);   break;
+    case 3: result.setX(right);  break;
+    }
+
+    result.setX(qBound(left, result.x(), right));
+    result.setY(qBound(top,  result.y(), bottom));
+    return result;
+}
+
 // 根据周长位置返回内法线角度（朝向用户/屏幕内部）
 // 底边 → 90°（朝上）, 右边 → 180°（朝左）, 顶边 → 270°（朝下）, 左边 → 0°/360°（朝右）
 float MainWindow::computeHeadingFromPerimeter(float t) const {
@@ -319,7 +431,12 @@ void MainWindow::showSpiderFeet() {
                                        screenPos.y() + SpiderTuning::kFootH / 2.0f));
         foot->move(screenPos);
         foot->show();
+#ifdef Q_OS_MACOS
+        // macOS: 将蛛腿窗口层级设为普通级别(0)，低于 MainWindow 的 ToolTip 级别
+        setNativeWindowLevel(foot, 0);
+#else
         foot->stackUnder(this);
+#endif
     }
 
     // 初始化朝向
@@ -364,53 +481,150 @@ QVector2D MainWindow::getIdealFootPos(int legIndex,
     const QVector2D bodyCenter = bodyPos + QVector2D(this->width() * 0.5f,
                                                       this->height() * 0.5f);
 
-    // 圆角矩形上的锚点 + 外法线
+    // 圆角矩形上的锚点
     const float halfW = this->width() * SpiderTuning::kBodyRectScale * 0.5f;
     const float halfH = this->height() * SpiderTuning::kBodyRectScale * 0.5f;
     LocalPoint lp = bodyRoundedRectPoint(cfg.perimeterFraction, halfW, halfH);
-
-    // 旋转到屏幕空间
     const QVector2D anchor = bodyCenter + localToScreen(lp.right, lp.forward, headingRad);
-    const QVector2D reachDir = localToScreen(lp.normalRight, lp.normalForward, headingRad);
 
-    const QVector2D prediction = dirVelocity * SpiderTuning::kVelocityPredict;
-    QVector2D rawPos = anchor + reachDir * SpiderTuning::kFootReach + prediction;
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (!screen) return anchor;
+    QRect geo = screen->geometry();
+    float left   = geo.left();
+    float right  = geo.right();
+    float top    = geo.top();
+    float bottom = geo.bottom();
 
-    // 投射到最近的屏幕边框
-    QVector2D projected = projectToScreenEdge(rawPos);
+    const float edgeThresh = SpiderTuning::kLegLengthTotal * SpiderTuning::kEdgeReachFraction;
 
-    // 角度阈值钳制
-    QVector2D toFoot = projected - anchor;
-    float footDist = toFoot.length();
-    if (footDist > 1e-3f) {
-        float footAngle = qRadiansToDegrees(qAtan2(-toFoot.y(), toFoot.x()));
-        float reachAngle = qRadiansToDegrees(qAtan2(-reachDir.y(), reachDir.x()));
-        float angleDiff = footAngle - reachAngle;
-        while (angleDiff > 180.0f) angleDiff -= 360.0f;
-        while (angleDiff < -180.0f) angleDiff += 360.0f;
+    // 锚点到各边距离: 底/顶/左/右
+    float aDists[] = {
+        qAbs(anchor.y() - bottom),
+        qAbs(anchor.y() - top),
+        qAbs(anchor.x() - left),
+        qAbs(anchor.x() - right),
+    };
+    QVector2D edgeNormals[] = {
+        {0, 1}, {0, -1}, {-1, 0}, {1, 0},
+    };
 
-        if (qAbs(angleDiff) > SpiderTuning::kLegAngleThreshold) {
-            float clampedAngle = reachAngle
-                + qBound(-SpiderTuning::kLegAngleThreshold,
-                         angleDiff,
-                         SpiderTuning::kLegAngleThreshold);
-            float clampedRad = qDegreesToRadians(clampedAngle);
-            QVector2D clampedDir(qCos(clampedRad), -qSin(clampedRad));
-            projected = anchor + clampedDir * footDist;
-            projected = projectToScreenEdge(projected);
+    // 找最近的合格边（锚点距边 ≤ 阈值）
+    int bestEdge = -1;
+    float bestDist = 1e9f;
+    for (int i = 0; i < 4; ++i) {
+        if (aDists[i] <= edgeThresh && aDists[i] < bestDist) {
+            bestDist = aDists[i];
+            bestEdge = i;
+        }
+    }
+    if (bestEdge < 0) {
+        bestDist = 1e9f;
+        for (int i = 0; i < 4; ++i) {
+            if (aDists[i] < bestDist) { bestDist = aDists[i]; bestEdge = i; }
         }
     }
 
-    return projected;
+    // 锚点垂直投影到边
+    QVector2D edgePoint;
+    switch (bestEdge) {
+    case 0: edgePoint = QVector2D(anchor.x(), bottom); break;
+    case 1: edgePoint = QVector2D(anchor.x(), top);    break;
+    case 2: edgePoint = QVector2D(left, anchor.y());   break;
+    case 3: edgePoint = QVector2D(right, anchor.y());  break;
+    }
+
+    // 沿边展开：用 bodyCenter→anchor 向量在边上的切向分量
+    // 左腿向左展开，右腿向右展开，自然形成蜘蛛腿的张开姿态
+    QVector2D bodyToAnchor = anchor - bodyCenter;
+    QVector2D eN = edgeNormals[bestEdge];
+    QVector2D tangent = bodyToAnchor - eN * QVector2D::dotProduct(bodyToAnchor, eN);
+    float tangentLen = tangent.length();
+
+    QVector2D idealPos = edgePoint;
+    if (tangentLen > 1e-3f) {
+        idealPos += (tangent / tangentLen) * SpiderTuning::kFootReach;
+    }
+    idealPos += dirVelocity * SpiderTuning::kVelocityPredict;
+
+    // 固定到边 + 钳制到屏幕
+    switch (bestEdge) {
+    case 0: idealPos.setY(bottom); break;
+    case 1: idealPos.setY(top);    break;
+    case 2: idealPos.setX(left);   break;
+    case 3: idealPos.setX(right);  break;
+    }
+    idealPos.setX(qBound(left, idealPos.x(), right));
+    idealPos.setY(qBound(top, idealPos.y(), bottom));
+
+    // ── 拐角提前伸腿 ──
+    // 当脚尖目标已经接近屏幕拐角（距两条边都很近），说明当前边快到头了
+    // 将脚尖目标沿下一条边滑出，让前方的腿提前抓住下一条边
+    const float L = SpiderTuning::kCornerLookahead;
+    float dLeft   = idealPos.x() - left;
+    float dRight  = right - idealPos.x();
+    float dTop    = idealPos.y() - top;
+    float dBottom = bottom - idealPos.y();
+
+    // 检查是否卡在某个角落（一个轴贴着边，另一个轴也接近边）
+    if (bestEdge == 0 || bestEdge == 1) {
+        // 脚在上/下边，检查是否接近左右角
+        if (dRight < L) {
+            // 接近右边缘 → 让脚滑到右边上
+            idealPos.setX(right);
+            float slide = L - dRight;
+            if (bestEdge == 0) idealPos.setY(bottom - slide);  // 右下角→右边往上
+            else               idealPos.setY(top + slide);     // 右上角→右边往下
+        } else if (dLeft < L) {
+            // 接近左边缘 → 让脚滑到左边上
+            idealPos.setX(left);
+            float slide = L - dLeft;
+            if (bestEdge == 0) idealPos.setY(bottom - slide);  // 左下角→左边往上
+            else               idealPos.setY(top + slide);     // 左上角→左边往下
+        }
+    } else {
+        // 脚在左/右边，检查是否接近上下角
+        if (dBottom < L) {
+            idealPos.setY(bottom);
+            float slide = L - dBottom;
+            if (bestEdge == 3) idealPos.setX(right - slide);   // 右下角→下边往左
+            else               idealPos.setX(left + slide);    // 左下角→下边往右
+        } else if (dTop < L) {
+            idealPos.setY(top);
+            float slide = L - dTop;
+            if (bestEdge == 3) idealPos.setX(right - slide);   // 右上角→上边往左
+            else               idealPos.setX(left + slide);    // 左上角→上边往右
+        }
+    }
+
+    idealPos.setX(qBound(left, idealPos.x(), right));
+    idealPos.setY(qBound(top, idealPos.y(), bottom));
+
+    return idealPos;
 }
 
-// ─── IK solver (unchanged) ────────────────────────────────────
+// ─── IK solver ───────────────────────────────────────────────
+//
+// 对单条腿执行完整的逆运动学求解，流程：
+//   1. 收集该腿的所有段 widget，读取当前关节位置
+//   2. 根据身体朝向计算该腿在圆角矩形身体上的锚点（根部目标位置）
+//   3. 根部位置 lerp 平滑跟随目标，避免瞬移
+//   4. 对根部施加 squish 压扁，缩短根→脚有效距离以产生腿弯曲效果
+//   5. 用类 FABRIK 算法迭代求解各关节位置
+//   6. 将求解结果写回各段 widget 的屏幕位置
+//
+// 参数：
+//   legIndex — 腿索引 (0=FL, 1=BL, 2=FR, 3=BR)
+//   bodyPos  — MainWindow 左上角的屏幕坐标
+//   footPos  — 该腿脚尖的目标屏幕坐标（由步态系统决定）
 
 void MainWindow::solveIK(int legIndex, const QVector2D &bodyPos,
                           const QVector2D &footPos) {
     const LegLocalConfig &cfg = LEG_CONFIGS[legIndex];
     LegState &state = m_legStates[legIndex];
 
+    // ── 第1步：收集该腿的所有段 widget ──
+    // 每条腿有 kFeetPerLeg 个 SpiderFeet widget，按 "前缀+编号" 从哈希表中查找
+    // segments[0] = 根部（靠近身体），segments[last] = 脚尖
     QVector<SpiderFeet*> segments;
     segments.reserve(SpiderTuning::kFeetPerLeg);
     for (int i = 0; i < SpiderTuning::kFeetPerLeg; ++i) {
@@ -419,6 +633,8 @@ void MainWindow::solveIK(int legIndex, const QVector2D &bodyPos,
     }
     if (segments.isEmpty()) return;
 
+    // ── 第2步：读取各关节当前屏幕位置作为 FABRIK 初始值 ──
+    // 若某段尚未初始化（pos 为零向量），则回退到根部位置
     QVector<QVector2D> joints;
     joints.reserve(segments.size());
     for (SpiderFeet *seg : segments) {
@@ -429,46 +645,96 @@ void MainWindow::solveIK(int legIndex, const QVector2D &bodyPos,
         joints.append(p);
     }
 
-    // 圆角矩形锚点 → 目标根部
+    // ── 第3步：计算该腿在身体圆角矩形上的锚点 ──
+    // 将蜘蛛朝向角转为弧度，算出身体中心的屏幕坐标
     const float headingRad = qDegreesToRadians(m_heading);
     const QVector2D bodyCenter = bodyPos + QVector2D(this->width() * 0.5f,
                                                       this->height() * 0.5f);
+    // 圆角矩形的半宽/半高 = 窗口尺寸 × kBodyRectScale 的一半
     const float halfW = this->width() * SpiderTuning::kBodyRectScale * 0.5f;
     const float halfH = this->height() * SpiderTuning::kBodyRectScale * 0.5f;
+    // 在圆角矩形路径上按 perimeterFraction 采样，得到本地坐标和外法线
     LocalPoint lp = bodyRoundedRectPoint(cfg.perimeterFraction, halfW, halfH);
+    // 将本地坐标旋转到屏幕空间，加上身体中心得到目标根部位置
     state.targetRootPos = bodyCenter + localToScreen(lp.right, lp.forward, headingRad);
 
-    // 平滑跟随
+    // ── 第4步：根部位置平滑跟随 ──
+    // currentRootPos 以 kRootLerpSpeed 的比例向 targetRootPos 线性插值
+    // 这使得转弯时根部不会瞬间跳到新锚点，而是平滑过渡
     state.currentRootPos = state.currentRootPos
         + (state.targetRootPos - state.currentRootPos) * SpiderTuning::kRootLerpSpeed;
 
     const QVector2D rootPos = state.currentRootPos;
+
+    // ── 第5步：身体压扁（squish） ──
+    // 将 IK 求解用的根部沿 根→脚 方向推进 kBodySquish 比例
+    // 效果：缩短了根到脚的有效距离，FABRIK 为了让每段保持 segLen
+    //       只能让中间关节向外弯折，从而产生蛛腿弯曲的自然效果
+    const QVector2D ikRoot = rootPos + (footPos - rootPos) * SpiderTuning::kBodySquish;
+    m_debugIkRoot[legIndex] = ikRoot;
+
+    // 每段长度 = 总腿长 / (段数 - 1)，总腿长 = 所有段间距之和
     const float segLen = SpiderTuning::kLegLengthTotal / qMax(1, segments.size() - 1);
     const float totalLen = segLen * qMax(1, segments.size() - 1);
 
-    if ((footPos - rootPos).length() >= totalLen) {
-        QVector2D dir = (footPos - rootPos).normalized();
+    // 计算锚点外法线方向（屏幕空间），用于 FABRIK 内部弯曲方向偏置
+    QVector2D outwardNormal = localToScreen(lp.normalRight, lp.normalForward, headingRad);
+
+    // ── 第6步：FABRIK 逆运动学求解 ──
+    if ((footPos - ikRoot).length() >= totalLen) {
+        // 情况A：脚尖超出最大伸展距离（根到脚距离 ≥ 总腿长）
+        // 无法弯曲，所有关节沿根→脚方向拉直排列
+        QVector2D dir = (footPos - ikRoot).normalized();
         if (dir.lengthSquared() < 1e-6f) dir = QVector2D(1.0f, 0.0f);
-        joints[0] = rootPos;
+        joints[0] = ikRoot;
         for (int i = 1; i < joints.size(); ++i)
             joints[i] = joints[i - 1] + dir * segLen;
     } else {
+        // 情况B：脚尖在可达范围内，执行 FABRIK 正反向迭代
         for (int it = 0; it < SpiderTuning::kIkIterations; ++it) {
+            // ── 反向传递 ──
             joints.last() = footPos;
             for (int i = joints.size() - 2; i >= 0; --i) {
                 QVector2D dir = (joints[i] - joints[i + 1]).normalized();
                 if (dir.lengthSquared() < 1e-6f) dir = QVector2D(1.0f, 0.0f);
                 joints[i] = joints[i + 1] + dir * segLen;
             }
-            joints.first() = rootPos;
+
+            // ── 正向传递 ──
+            joints.first() = ikRoot;
             for (int i = 1; i < joints.size(); ++i) {
                 QVector2D dir = (joints[i] - joints[i - 1]).normalized();
                 if (dir.lengthSquared() < 1e-6f) dir = QVector2D(1.0f, 0.0f);
                 joints[i] = joints[i - 1] + dir * segLen;
             }
+
+            // ── 弯曲方向偏置（pole target） ──
+            // 每轮迭代后给中间关节施加一个朝外法线方向的小偏移
+            // 持续引导求解器收敛到正确的弯曲方向，不会产生逐帧翻转抖动
+            constexpr float kBendBias = 3.0f;  // 偏置强度(px)
+            for (int i = 1; i < joints.size() - 1; ++i) {
+                joints[i] += outwardNormal * kBendBias;
+            }
         }
+        // 经过 kIkIterations 轮迭代后，关节链满足：
+        //   - 根部固定在 ikRoot
+        //   - 相邻关节间距均为 segLen
+        //   - 末端尽可能接近 footPos
     }
 
+    // ── IK 后修正：将根关节拉回身体锚点并重新约束段长 ──
+    // ikRoot 仅用于 IK 内部求解以产生弯曲，求解完成后把整条链锚定回 rootPos
+    // 从根部做一次正向传递，保证每段长度仍为 segLen
+    joints[0] = rootPos;
+    for (int i = 1; i < joints.size(); ++i) {
+        QVector2D dir = (joints[i] - joints[i - 1]).normalized();
+        if (dir.lengthSquared() < 1e-6f) dir = QVector2D(1.0f, 0.0f);
+        joints[i] = joints[i - 1] + dir * segLen;
+    }
+
+    // ── 第8步：将求解结果写回各段 widget ──
+    // 更新每个 SpiderFeet 的逻辑位置和屏幕位置
+    // move() 时减去半宽/半高，因为 joints 存的是段中心坐标
     for (int i = 0; i < segments.size(); ++i) {
         segments[i]->setCurrentPos(joints[i]);
         segments[i]->move(static_cast<int>(joints[i].x() - SpiderTuning::kFootW / 2.0f),
@@ -539,7 +805,25 @@ void MainWindow::updateFeetPositions() {
         solveIK(i, bodyPos, state.currentFootPos);
     }
 
-    this->raise();
+    update();  // 触发 paintEvent 重绘 debug 红框
+
+    // debug: 每 ~5秒 输出一次坐标
+    if (m_frame % 300 == 0) {
+        qDebug() << "=== frame" << m_frame << "===";
+        qDebug() << "  window pos:" << this->pos()
+                 << " size:" << this->size()
+                 << " heading:" << m_heading;
+        for (int i = 0; i < 4; ++i) {
+            qDebug().nospace()
+                << "  leg[" << i << "]"
+                << " rootPos=(" << m_legStates[i].currentRootPos.x()
+                << "," << m_legStates[i].currentRootPos.y() << ")"
+                << " ikRoot=(" << m_debugIkRoot[i].x()
+                << "," << m_debugIkRoot[i].y() << ")"
+                << " footPos=(" << m_legStates[i].currentFootPos.x()
+                << "," << m_legStates[i].currentFootPos.y() << ")";
+        }
+    }
 }
 
 // ─── Perimeter walk + spring body ─────────────────────────────
@@ -548,7 +832,8 @@ void MainWindow::updateAutoWalk() {
     if (!ui->autoActionCheckbox->isChecked()) return;
 
     // 走走停停
-    float phase = qSin(m_frame * 0.012f);
+    // float phase = qSin(m_frame * 0.012f);
+    float phase = qSin(m_frame * 0.022f);
     float burst = qMax(0.0f, phase);
     float micro = 1.0f + 0.15f * qSin(m_frame * 0.07f);
     float speed = SpiderTuning::kWalkSpeed * burst * micro;
@@ -605,4 +890,37 @@ void MainWindow::manualActionCheckboxSlot() {
 MainWindow::~MainWindow()
 {
     delete ui;
+}
+
+void MainWindow::paintEvent(QPaintEvent *event)
+{
+    QMainWindow::paintEvent(event);
+
+    QPainter painter(this);
+    painter.setPen(QPen(Qt::red, 2));
+    painter.setBrush(Qt::NoBrush);
+
+    const QPoint origin = this->mapToGlobal(QPoint(0, 0));
+    const int hw = SpiderTuning::kFootW / 2;
+    const int hh = SpiderTuning::kFootH / 2;
+
+    for (int i = 0; i < 4; ++i) {
+        // ikRoot 是屏幕坐标，转换为 MainWindow 本地坐标
+        int lx = static_cast<int>(m_debugIkRoot[i].x()) - origin.x() - hw;
+        int ly = static_cast<int>(m_debugIkRoot[i].y()) - origin.y() - hh;
+        painter.drawRect(lx, ly, SpiderTuning::kFootW, SpiderTuning::kFootH);
+    }
+
+    // ideal root foot pos
+    int winWidth = this->width();
+    int winHeight = this->height();
+
+    int rectW = static_cast<int>(winWidth * 0.8);
+    int rectH = static_cast<int>(winHeight * 0.8);
+
+    int rectX = (winWidth - rectW) / 2;
+    int rectY = (winHeight - rectH) / 2;
+
+    painter.setPen(QPen(Qt::blue, 2, Qt::DashLine));
+    painter.drawRect(rectX, rectY, rectW, rectH);
 }

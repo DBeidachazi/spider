@@ -57,9 +57,16 @@ private:
     QPoint m_lastBodyPos;
 
     LegState m_legStates[4];
+    QVector2D m_debugIkRoot[4];   // debug: ikRoot positions for red overlay
+
+protected:
+    void paintEvent(QPaintEvent *event) override;
 
 
     QVector2D projectToScreenEdge(const QVector2D &point) const;
+    QVector2D projectToScreenEdge(const QVector2D &point,
+                                   const QVector2D &anchor,
+                                   float maxAnchorDist) const;
     QVector2D perimeterToBodyPos(float t) const;
     float perimeterLength() const;
     float computeHeadingFromPerimeter(float t) const;

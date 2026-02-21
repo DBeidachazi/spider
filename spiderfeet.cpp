@@ -13,7 +13,7 @@ SpiderFeet::SpiderFeet(QWidget *parent)
     // Use ToolTip for positioning; on XCB (X11/XWayland) we can show a normal tool window title bar.
     // TODO XWayland BUG!!!
     if (QGuiApplication::platformName() == "xcb") {
-        setWindowFlags(Qt::Tool);
+        setWindowFlags(Qt::Tool | Qt::FramelessWindowHint);
     } else {
         setWindowFlags(Qt::ToolTip | Qt::FramelessWindowHint | Qt::WindowStaysOnBottomHint);
     }

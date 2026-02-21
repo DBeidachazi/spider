@@ -10,3 +10,8 @@ target("spider")
     add_files("main.cpp", "mainwindow.cpp", "spiderfeet.cpp")
     add_files("mainwindow.h", "spiderfeet.h")
     add_files("mainwindow.ui", "spiderfeet.ui")
+
+    if is_plat("macosx") then
+        add_files("windowlevel.mm")
+        add_frameworks("AppKit")
+    end
