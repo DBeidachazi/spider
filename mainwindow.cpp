@@ -9,7 +9,12 @@
 #include <QPainter>
 #include <QMediaDevices>
 #include <QCameraDevice>
+#include <QThread>
+#include <QFile>
+#include <QCoreApplication>
 #include <functional>
+
+#include "faceworker.h"
 
 #ifdef Q_OS_MACOS
 extern void setNativeWindowLevel(QWidget *widget, int level);
@@ -288,6 +293,18 @@ void MainWindow::initCamera() {
 #endif
 }
 
+static QString findModelPath() {
+    QStringList candidates = {
+        QCoreApplication::applicationDirPath() + "/../Resources/weights/yolov8n-face.onnx",
+        QCoreApplication::applicationDirPath() + "/weights/yolov8n-face.onnx",
+        QString("weights/yolov8n-face.onnx"),
+    };
+    for (const auto &path : candidates) {
+        if (QFile::exists(path)) return path;
+    }
+    return {};
+}
+
 void MainWindow::startCamera() {
     QCameraDevice defaultCam = QMediaDevices::defaultVideoInput();
     if (defaultCam.isNull()) {
@@ -295,24 +312,94 @@ void MainWindow::startCamera() {
         return;
     }
 
-    m_videoWidget = new QVideoWidget(centralWidget());
-    m_videoWidget->setGeometry(0, 0, centralWidget()->width(), centralWidget()->height());
-    m_videoWidget->lower();
-    m_videoWidget->show();
-
     m_camera = new QCamera(defaultCam, this);
     m_captureSession = new QMediaCaptureSession(this);
     m_captureSession->setCamera(m_camera);
-    m_captureSession->setVideoOutput(m_videoWidget);
 
-    connect(m_camera, &QCamera::errorOccurred, this, [this](QCamera::Error error, const QString &desc) {
-        qDebug() << "Camera error:" << error << desc;
-        if (m_videoWidget) {
-            m_videoWidget->hide();
+    // Use QVideoSink for frame-by-frame access instead of QVideoWidget
+    m_videoSink = new QVideoSink(this);
+    m_captureSession->setVideoOutput(m_videoSink);
+    connect(m_videoSink, &QVideoSink::videoFrameChanged,
+            this, &MainWindow::onVideoFrame);
+
+    // Set up face detection worker thread
+    QString modelPath = findModelPath();
+    if (!modelPath.isEmpty()) {
+        m_faceWorker = new FaceWorker(modelPath.toStdString());
+        m_faceThread = new QThread(this);
+        m_faceWorker->moveToThread(m_faceThread);
+
+        connect(m_faceThread, &QThread::finished,
+                m_faceWorker, &QObject::deleteLater);
+        connect(m_faceWorker, &FaceWorker::faceDetected,
+                this, &MainWindow::onFaceDetected);
+        connect(m_faceWorker, &FaceWorker::noFaceDetected,
+                this, &MainWindow::onNoFaceDetected);
+
+        m_faceThread->start();
+
+        if (m_faceWorker->isReady()) {
+            qDebug() << "Face detection model loaded from:" << modelPath;
+        } else {
+            qDebug() << "Face detection model failed to load.";
         }
+    } else {
+        qDebug() << "Face detection model not found, showing full camera frame.";
+    }
+
+    connect(m_camera, &QCamera::errorOccurred, this, [](QCamera::Error error, const QString &desc) {
+        qDebug() << "Camera error:" << error << desc;
     });
 
     m_camera->start();
+}
+
+// ─── Video frame / face detection slots ──────────────────────
+
+void MainWindow::onVideoFrame(const QVideoFrame &frame) {
+    QImage img = frame.toImage();
+    if (img.isNull()) return;
+    m_latestFrame = img;
+
+    // Send frame to worker if it's idle
+    if (m_faceWorker && !m_faceWorker->isBusy()) {
+        QMetaObject::invokeMethod(m_faceWorker, "processFrame",
+                                  Qt::QueuedConnection,
+                                  Q_ARG(QImage, m_latestFrame));
+    }
+}
+
+void MainWindow::onFaceDetected(QRect bbox, float confidence) {
+    Q_UNUSED(confidence);
+
+    // Expand bbox: make it square and multiply by 1.8x for context
+    float cx = bbox.x() + bbox.width() / 2.0f;
+    float cy = bbox.y() + bbox.height() / 2.0f;
+    float size = qMax(bbox.width(), bbox.height()) * 1.8f;
+    QRectF expanded(cx - size / 2.0, cy - size / 2.0, size, size);
+
+    if (!m_faceDetected) {
+        // First detection — set directly, no smoothing
+        m_faceRect = expanded;
+    } else {
+        // EMA smoothing
+        const float alpha = 0.3f;
+        m_faceRect = QRectF(
+            m_faceRect.x() + (expanded.x() - m_faceRect.x()) * alpha,
+            m_faceRect.y() + (expanded.y() - m_faceRect.y()) * alpha,
+            m_faceRect.width() + (expanded.width() - m_faceRect.width()) * alpha,
+            m_faceRect.height() + (expanded.height() - m_faceRect.height()) * alpha
+        );
+    }
+    m_faceDetected = true;
+    m_noFaceFrames = 0;
+}
+
+void MainWindow::onNoFaceDetected() {
+    m_noFaceFrames++;
+    if (m_noFaceFrames > 30) {
+        m_faceDetected = false;
+    }
 }
 
 // ─── Perimeter helpers ────────────────────────────────────────
@@ -459,6 +546,46 @@ float MainWindow::computeHeadingFromPerimeter(float t) const {
     return 0.0f;                           // 左边：朝右
 }
 
+// 根据4条腿脚尖实际踩在哪条屏幕边，求各边内法线平均值，得到连续朝向角
+// 两腿在底+两腿在右 → 平均法线朝左上 → heading ≈ 135°
+float MainWindow::computeHeadingFromLegs() const {
+    QScreen *screen = QGuiApplication::primaryScreen();
+    if (!screen) return m_heading;
+    QRect geo = screen->geometry();
+    float left = geo.left(), right = geo.right();
+    float top = geo.top(), bottom = geo.bottom();
+
+    QVector2D avgNormal(0, 0);
+    int count = 0;
+
+    for (int i = 0; i < 4; ++i) {
+        QVector2D foot = m_legStates[i].currentFootPos;
+        if (foot.isNull()) continue;
+
+        float dLeft   = qAbs(foot.x() - left);
+        float dRight  = qAbs(foot.x() - right);
+        float dTop    = qAbs(foot.y() - top);
+        float dBottom = qAbs(foot.y() - bottom);
+        float dMin    = qMin(qMin(dLeft, dRight), qMin(dTop, dBottom));
+
+        // 脚尖最近边的内法线
+        if      (dMin == dBottom) avgNormal += QVector2D( 0, -1);  // 底边 → 朝上
+        else if (dMin == dTop)    avgNormal += QVector2D( 0,  1);  // 顶边 → 朝下
+        else if (dMin == dLeft)   avgNormal += QVector2D( 1,  0);  // 左边 → 朝右
+        else                      avgNormal += QVector2D(-1,  0);  // 右边 → 朝左
+        ++count;
+    }
+
+    if (count == 0 || avgNormal.lengthSquared() < 1e-6f)
+        return m_heading;
+
+    // 平均法线 → 朝向角  (屏幕坐标 Y 向下)
+    // heading 约定: 0°=右, 90°=上, 180°=左, 270°=下
+    float heading = qRadiansToDegrees(qAtan2(-avgNormal.y(), avgNormal.x()));
+    if (heading < 0) heading += 360.0f;
+    return heading;
+}
+
 // ─── Leg segment init (structure unchanged) ───────────────────
 
 void MainWindow::initSpiderFeet() {
@@ -497,6 +624,7 @@ void MainWindow::showSpiderFeet() {
     // 初始化朝向
     m_heading = computeHeadingFromPerimeter(m_perimeterPos);
     m_targetHeading = m_heading;
+    m_faceHeading = m_heading;
 
     // 初始化脚和根部位置
     QVector2D bodyPos(this->pos().x(), this->pos().y());
@@ -860,6 +988,15 @@ void MainWindow::updateFeetPositions() {
         solveIK(i, bodyPos, state.currentFootPos);
     }
 
+    // 更新人脸朝向：从实际蛛腿位置推算，平滑跟随
+    float targetFH = computeHeadingFromLegs();
+    float fhDiff = targetFH - m_faceHeading;
+    while (fhDiff > 180.0f)  fhDiff -= 360.0f;
+    while (fhDiff < -180.0f) fhDiff += 360.0f;
+    m_faceHeading += fhDiff * 0.15f;
+    m_faceHeading = fmod(m_faceHeading, 360.0f);
+    if (m_faceHeading < 0) m_faceHeading += 360.0f;
+
     update();  // 触发 paintEvent 重绘 debug 红框
 
     // debug: 每 ~5秒 输出一次坐标
@@ -944,6 +1081,10 @@ void MainWindow::manualActionCheckboxSlot() {
 
 MainWindow::~MainWindow()
 {
+    if (m_faceThread) {
+        m_faceThread->quit();
+        m_faceThread->wait();
+    }
     delete ui;
 }
 
@@ -952,6 +1093,52 @@ void MainWindow::paintEvent(QPaintEvent *event)
     QMainWindow::paintEvent(event);
 
     QPainter painter(this);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform);
+
+    // ── Draw camera frame as background ──
+    if (!m_latestFrame.isNull()) {
+        if (m_faceDetected && m_faceRect.isValid()) {
+            // Crop face region from frame and draw rotated
+            QRectF sourceRect = m_faceRect.intersected(QRectF(m_latestFrame.rect()));
+            if (sourceRect.isValid()) {
+                float faceRotation = 90.0f - m_faceHeading;
+                float rad = qDegreesToRadians(faceRotation);
+                float sinA = qAbs(qSin(rad));
+                float cosA = qAbs(qCos(rad));
+
+                float fw = static_cast<float>(sourceRect.width());
+                float fh = static_cast<float>(sourceRect.height());
+                float W = static_cast<float>(width());
+                float H = static_cast<float>(height());
+
+                // 将窗口四角逆旋转到源图坐标，求所需缩放使其全部落在源矩形内
+                float scale = qMax((W * cosA + H * sinA) / fw,
+                                   (W * sinA + H * cosA) / fh);
+
+                painter.save();
+                painter.translate(width() / 2.0, height() / 2.0);
+                painter.rotate(static_cast<double>(faceRotation));
+                painter.scale(static_cast<double>(scale), static_cast<double>(scale));
+                painter.drawImage(QPointF(-sourceRect.width() / 2.0, -sourceRect.height() / 2.0),
+                                  m_latestFrame, sourceRect);
+                painter.restore();
+            }
+        } else {
+            // No face detected — show full camera frame, scaled to fill
+            float scaleX = static_cast<float>(width()) / m_latestFrame.width();
+            float scaleY = static_cast<float>(height()) / m_latestFrame.height();
+            float scale = qMax(scaleX, scaleY);
+
+            painter.save();
+            painter.translate(width() / 2.0, height() / 2.0);
+            painter.scale(static_cast<double>(scale), static_cast<double>(scale));
+            painter.drawImage(QPointF(-m_latestFrame.width() / 2.0, -m_latestFrame.height() / 2.0),
+                              m_latestFrame);
+            painter.restore();
+        }
+    }
+
+    // ── Debug overlay ──
     painter.setPen(QPen(Qt::red, 2));
     painter.setBrush(Qt::NoBrush);
 
@@ -982,7 +1169,4 @@ void MainWindow::paintEvent(QPaintEvent *event)
 
 void MainWindow::resizeEvent(QResizeEvent *event) {
     QMainWindow::resizeEvent(event);
-    if (m_videoWidget && centralWidget()) {
-        m_videoWidget->setGeometry(0, 0, centralWidget()->width(), centralWidget()->height());
-    }
 }

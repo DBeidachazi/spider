@@ -7,8 +7,13 @@
 #include <QVector2D>
 #include <QCamera>
 #include <QMediaCaptureSession>
-#include <QVideoWidget>
+#include <QVideoSink>
+#include <QVideoFrame>
+#include <QImage>
 #include "spiderfeet.h"
+
+class FaceWorker;
+class QThread;
 
 QT_BEGIN_NAMESPACE
 namespace Ui {
@@ -55,6 +60,7 @@ private:
 
     float m_heading = 90.0f;       // current heading (degrees)
     float m_targetHeading = 90.0f; // target heading from edge normal
+    float m_faceHeading = 90.0f;   // face heading derived from leg positions (smooth)
 
 
     QVector2D m_bodyVelocity;
@@ -66,7 +72,16 @@ private:
 
     QCamera *m_camera = nullptr;
     QMediaCaptureSession *m_captureSession = nullptr;
-    QVideoWidget *m_videoWidget = nullptr;
+
+    // Face detection pipeline
+    QVideoSink *m_videoSink = nullptr;
+    QImage m_latestFrame;
+    QRectF m_faceRect;
+    bool m_faceDetected = false;
+    int m_noFaceFrames = 0;
+
+    QThread *m_faceThread = nullptr;
+    FaceWorker *m_faceWorker = nullptr;
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -82,6 +97,7 @@ protected:
     float computeHeadingFromPerimeter(float t) const;
 
     void updateAutoWalk();
+    float computeHeadingFromLegs() const;
     QVector2D getIdealFootPos(int legIndex, const QVector2D &bodyPos,
                               const QVector2D &dirVelocity) const;
     void solveIK(int legIndex, const QVector2D &bodyPos, const QVector2D &footPos);
@@ -90,5 +106,8 @@ private slots:
     void manualActionCheckboxSlot();
     void autoActionCheckboxSlot();
     void updateFeetPositions();
+    void onVideoFrame(const QVideoFrame &frame);
+    void onFaceDetected(QRect bbox, float confidence);
+    void onNoFaceDetected();
 };
 #endif
